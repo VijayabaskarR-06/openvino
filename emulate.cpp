@@ -1,6 +1,8 @@
 // Host-side emulation of oneDNN's blocked GEMM launches with 2D quantization.
 //
-// The new helpers (quant_2d_a/quant_2d_b) are compiled verbatim from jit.cpp.
+// The new helper (quant_offset) is compiled verbatim from jit.cpp, the leading
+// dimension, per tensor offsets and k blocking follow gen_t::execute() and
+// GEMMStrategy::preflight().
 // The "old" logic is a transcription of the code being replaced. For every
 // launch, the kernel's addressing of zero points and scales is emulated as
 // gemmstone does it (base + offset_Xq + local index using ldXq) and compared
@@ -25,8 +27,8 @@ namespace gpu {
 namespace intel {
 namespace gemm {
 #include "quant_helpers.inc"
-quant_2d_t new_quant(const gemmstone::GEMMProblem &p, bool is_a, dim_t mn, dim_t k) {
-    return is_a ? quant_2d_a(p, mn, k) : quant_2d_b(p, mn, k);
+dim_t new_offset(bool mn_major, dim_t ld, int g_mn, int g_k, dim_t mn, dim_t k) {
+    return quant_offset(mn_major, ld, g_mn, g_k, mn, k);
 }
 } // namespace gemm
 } // namespace intel
@@ -85,6 +87,7 @@ static std::vector<Launch> plan(const Case &c, bool fixed) {
     auto p = make_problem(c);
     bool q2d = c.is_a ? p.quantized2DA() : p.quantized2DB();
     dim_t block_k = c.block_k;
+    // GEMMStrategy::preflight() aligns the k blocking to the k group.
     if (fixed && q2d) block_k = crnd(block_k, std::max(c.gK, 1));
     bool has_off_arg = c.zp_dims >= 1 || c.scale2d; // offset_Xq is an argument
 
@@ -97,11 +100,20 @@ static std::vector<Launch> plan(const Case &c, bool fixed) {
             l.size_mn = std::min(c.block_mn, c.MN - Bmn);
             l.size_k = std::min(block_k, c.K - Bk);
             if (fixed) {
-                auto q = dnnl::impl::gpu::intel::gemm::new_quant(p, c.is_a, c.MN, c.K);
-                l.ld = q.ld;
-                l.off = q.offset(c.zp_dims, Bmn, Bk);
-                // Generator fix: offset_Xq no longer moves a scalar zero point.
-                l.zp_off = (c.zp_dims >= 1) ? l.off : 0;
+                // gen_t::execute()
+                bool q_2d = c.is_a ? (p.aOffset2D() || p.aScale2D() || p.needsAGroupSums())
+                                   : (p.bOffset2D() || p.bScale2D() || p.needsBGroupSums());
+                bool mn_major = c.is_a
+                        ? isColMajor(p.needsAGroupSums() ? p.Ag.layout : p.aScale2D() ? p.A_scale.layout : p.AO.layout)
+                        : !isColMajor(p.needsBGroupSums() ? p.Bg.layout : p.bScale2D() ? p.B_scale.layout : p.BO.layout);
+                int g_mn = c.is_a ? p.aqGroupM : p.bqGroupN;
+                int g_k = c.is_a ? p.aqGroupK : p.bqGroupK;
+                int zp_dims = c.is_a ? p.aoPtrDims : p.boPtrDims;
+                l.ld = q_2d ? (mn_major ? cdiv(c.MN, g_mn) : cdiv(c.K, g_k)) : 0;
+                // Scales and group sums use the 2D offset, zero point vectors
+                // move with m (A) or n (B) only, a scalar gets no offset.
+                l.off = q_2d ? dnnl::impl::gpu::intel::gemm::new_offset(mn_major, l.ld, g_mn, g_k, Bmn, Bk) : 0;
+                l.zp_off = (zp_dims >= 2) ? l.off : (zp_dims == 1) ? Bmn : 0;
             } else {
                 l.ld = c.mn_major ? cdiv(l.size_mn, c.gMN) : cdiv(c.K, c.gK);
                 l.off = has_off_arg ? Bmn : 0;
@@ -252,8 +264,12 @@ int main() {
     // offset can represent both (m-contiguous scales, group_m = 1, no k blocking).
     for (dim_t M : {65537, 151936})
         cases.push_back({"A-zp1d", true, M, 4096, 65536, 16777216, 1, 128, true, 1, true, true});
-    cases.push_back({"A-zp1d-rowmajor", true, 65537, 4096, 65536, 16777216, 1, 128, false, 1, true, false});
-    cases.push_back({"A-zp1d-kblk", true, 20000, 4096, 8192, 1024, 1, 128, true, 1, true, false});
+    cases.push_back({"A-zp1d-rowmajor", true, 65537, 4096, 65536, 16777216, 1, 128, false, 1, true, true});
+    cases.push_back({"A-zp1d-kblk", true, 20000, 4096, 8192, 1024, 1, 128, true, 1, true, true});
+    // B side, per-column zero point vector with 2D scales (dynamic quantization).
+    for (bool mn_major : {true, false})
+        for (dim_t N : {16385, 40000})
+            cases.push_back({"B-zp1d", false, N, 4096, 16384, 16777216, 1, 128, mn_major, 1, true, true});
     // A side, no 2D quantization: zero point vector only (must be unchanged).
     cases.push_back({"A-zp1d-only", true, 65537, 4096, 65536, 16777216, 1, 128, true, 1, false, true});
     // B side, n blocked (dynamically quantized activations, > 16384 tokens).
